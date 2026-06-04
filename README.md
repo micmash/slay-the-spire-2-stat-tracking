@@ -1,7 +1,7 @@
-﻿# Slay the Spire 2 â€” Run Tracker
+﻿# Slay the Spire 2 Run Tracker
 
 A local desktop app (PyQt6) that auto-imports your StS2 run history and shows
-run stats, card pick/win analytics, relic win rates, and per-card detail.
+run stats, card pick/win analytics, relic win rates, and per-card detail. Created with Claude as learning experiment
 
 ## Run it
 
@@ -46,4 +46,4 @@ they write to the project root.
 
 StS2 is in early access; card text/numbers may drift between patches. Re-run the
 `tools/` scrapers to refresh. In multiplayer, the card pool is shared, so a run
-can be offered cards from other classes â€” that's expected, not a bug.
+can be offered cards from other classes that's expected, not a bug.
