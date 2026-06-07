@@ -56,23 +56,6 @@ class DragBox(QWidget):
             self._start_geo   = self.geometry()
             self._start_mouse = e.globalPosition().toPoint()
 
-    def mouseMoveEvent(self, e):
-        gp = e.globalPosition().toPoint()
-        if self._resize_edge:
-            dx = gp.x() - self._start_mouse.x()
-            dy = gp.y() - self._start_mouse.y()
-            g  = QRect(self._start_geo)
-            e2 = self._resize_edge
-            if "r" in e2: g.setRight(g.right() + dx)
-            if "b" in e2: g.setBottom(g.bottom() + dy)
-            if "l" in e2: g.setLeft(g.left() + dx)
-            if "t" in e2: g.setTop(g.top() + dy)
-            if g.width() > 20 and g.height() > 10:
-                self.setGeometry(g)
-        elif self._drag_offset:
-            self.move(gp - self._drag_offset)
-        self.update()
-
     def mouseReleaseEvent(self, e):
         self._drag_offset  = None
         self._resize_edge  = None

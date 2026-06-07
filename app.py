@@ -1,7 +1,8 @@
 """Slay the Spire 2 — local run tracker. Entry point and UI tabs."""
 import sys
+import os
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -9,8 +10,8 @@ from PyQt6.QtWidgets import (
     QFileDialog, QTextEdit, QSplitter, QHeaderView, QComboBox,
     QLineEdit, QFrame, QScrollArea, QGridLayout, QStackedWidget,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QFileSystemWatcher, QSettings
-from PyQt6.QtGui import QColor, QPixmap
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QFileSystemWatcher, QSettings, QRect
+from PyQt6.QtGui import QColor, QPixmap, QFont, QFontMetrics, QPainter, QPen
 import ctypes
 
 from parser import RunSummary, find_default_save_path, fmt_card, fmt_relic
@@ -21,6 +22,7 @@ from theme import (
     DARK_BG, PANEL_BG, CARD_BG, ACCENT, ACCENT2, WIN_COLOR, LOSS_COLOR, TEXT, MUTED,
 )
 from stats import compute_card_stats, filter_runs
+import card_ocr
 from workers import RunLoader, ImageLoader, CardOcrWorker
 from active_run import parse_active_run, find_active_run_path, ActiveRunState
 from ui_utils import (
@@ -996,7 +998,6 @@ class ActiveRunTab(QWidget):
         if self._save_path is None or not self._save_path.exists():
             self._show_placeholder()
             return
-        import os
         try:
             mtime = os.path.getmtime(self._save_path)
         except OSError:
@@ -1044,8 +1045,7 @@ class ActiveRunTab(QWidget):
             self.ocr_updated.emit([])
 
     def _start_ocr(self):
-        from card_ocr import is_available
-        if not is_available() or self._ocr_scanning or self._reward_encounter_id is None or not self._ocr_enabled:
+        if not card_ocr.is_available() or self._ocr_scanning or self._reward_encounter_id is None or not self._ocr_enabled:
             return
         self._ocr_scanning = True
         all_ids = list(self._card_stats.keys()) if self._card_stats else []
@@ -1109,19 +1109,17 @@ class ActiveRunTab(QWidget):
                         self._ocr_votes[i].pop(0)
                     n = len(self._ocr_votes[i])
                     if n >= _OCR_MIN_SAMPLE:
-                        from collections import Counter
                         top_id, top_n = Counter(self._ocr_votes[i]).most_common(1)[0]
                         if top_n / n >= _OCR_LOCK_FRAC:
                             self._ocr_cache[i] = top_id
 
         # Build display from locked slots + current leading candidate for unlocked
-        from collections import Counter as _Ctr
         display = []
         for i in range(3):
             if self._ocr_cache[i]:
                 display.append(self._ocr_cache[i])
             elif self._ocr_votes[i]:
-                display.append(_Ctr(self._ocr_votes[i]).most_common(1)[0][0])
+                display.append(Counter(self._ocr_votes[i]).most_common(1)[0][0])
             else:
                 display.append(None)
 
@@ -1228,7 +1226,6 @@ class ActiveRunTab(QWidget):
                       if cid and cid in self._card_stats and self._card_stats[cid]["win_delta"] is not None]
             best_delta = max(deltas) if deltas else None
 
-        from cards_db import get_card, TYPE_COLORS
         for i, (card_frame, name_lbl, wr_lbl, wo_lbl, avg_lbl, d_lbl) in enumerate(self._ocr_slot_frames):
             card_id = ocr_results[i][0] if ocr_results and i < len(ocr_results) else None
             if not card_id:
@@ -1279,12 +1276,15 @@ class ActiveRunTab(QWidget):
         self._clear_content()
         self._placeholder.setVisible(False)
         r = self._run
-
-        # ── Card Reward panel (shown when fight just won, reward pending) ──
         if r.is_reward_pending:
             self._add(self._build_card_reward_panel())
+        self._add(self._build_run_header(r))
+        self._add(make_label("Deck", bold=True, size=13))
+        self._add(self._build_deck_grid(r))
+        self._add(make_label("Relics", bold=True, size=13))
+        self._add(self._build_relics_grid(r))
 
-        # ── Header strip ──────────────────────────────────────────────
+    def _build_run_header(self, r) -> QFrame:
         header = QFrame()
         header.setStyleSheet(f"QFrame {{ background: {CARD_BG}; border-radius: 8px; }}")
         hrow = QHBoxLayout(header)
@@ -1293,13 +1293,11 @@ class ActiveRunTab(QWidget):
 
         char_color = CHAR_COLORS.get(r.character_display, TEXT)
         hrow.addWidget(make_label(r.character_display, bold=True, size=18, color=char_color))
-
         mode_str = "Daily" if r.is_daily else (f"MP ({r.player_count}p)" if r.is_multiplayer else "SP")
         hrow.addWidget(make_label(f"A{r.ascension}  •  {mode_str}", size=12, color=MUTED))
         hrow.addWidget(make_label(f"{r.act_display}  •  Floor {r.floors_completed}", size=13))
         hrow.addStretch()
 
-        # HP bar
         hp_color = WIN_COLOR if r.hp_pct > 0.5 else ("#f39c12" if r.hp_pct > 0.25 else LOSS_COLOR)
         hp_frame = QFrame()
         hp_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
@@ -1309,100 +1307,73 @@ class ActiveRunTab(QWidget):
         hp_col.addWidget(make_label(f"HP  {r.current_hp} / {r.max_hp}", bold=True, size=12, color=hp_color))
         hp_col.addWidget(bar_widget(r.hp_pct, hp_color))
         hrow.addWidget(hp_frame)
-
-        # Gold
         hrow.addWidget(make_label(f"💰 {r.gold}", bold=True, size=13, color="#f1c40f"))
-
-        # Potions
         if r.potions:
             pot_str = "  ".join(p.display_name for p in r.potions)
             hrow.addWidget(make_label(f"🧪 {pot_str}", size=11, color=MUTED))
+        return header
 
-        self._add(header)
-
-        # ── Deck ──────────────────────────────────────────────────────
-        self._add(make_label("Deck", bold=True, size=13))
-
-        deck_frame = QFrame()
-        deck_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
-        deck_grid = QGridLayout(deck_frame)
-        deck_grid.setContentsMargins(12, 10, 12, 10)
-        deck_grid.setHorizontalSpacing(12)
-        deck_grid.setVerticalSpacing(6)
-        deck_grid.setColumnStretch(0, 3)  # card name
-        deck_grid.setColumnStretch(1, 2)  # description
-        deck_grid.setColumnStretch(2, 1)  # WR with
-        deck_grid.setColumnStretch(3, 1)  # win delta
-
-        # Header row
+    def _build_deck_grid(self, r) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(12, 10, 12, 10)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(3, 1)
         for col, txt in enumerate(["Card", "Effect", "WR With", "Win Δ"]):
-            lbl = make_label(txt, bold=True, size=10, color=MUTED)
-            deck_grid.addWidget(lbl, 0, col)
-
-        # Sort deck by floor added
-        sorted_deck = sorted(r.deck, key=lambda c: c.floor_added)
-        for row, card in enumerate(sorted_deck, start=1):
+            grid.addWidget(make_label(txt, bold=True, size=10, color=MUTED), 0, col)
+        for row, card in enumerate(sorted(r.deck, key=lambda c: c.floor_added), start=1):
             db = get_card(card.card_id)
-            card_type = db["type"] if db else "Skill"
-            type_color = TYPE_COLORS.get(card_type, MUTED)
-
+            type_color = TYPE_COLORS.get(db["type"] if db else "Skill", MUTED)
             name_lbl = make_label(card.display_name, size=11)
             name_lbl.setStyleSheet(f"color: {TEXT}; border-left: 3px solid {type_color}; padding-left: 6px;")
-            deck_grid.addWidget(name_lbl, row, 0)
-
+            grid.addWidget(name_lbl, row, 0)
             desc = (db["desc"] if db else "") or ""
             desc_lbl = QLabel(desc[:80] + ("…" if len(desc) > 80 else ""))
             desc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 10pt;")
             desc_lbl.setWordWrap(False)
-            deck_grid.addWidget(desc_lbl, row, 1)
-
-            # Historical stats for this card
+            grid.addWidget(desc_lbl, row, 1)
             s = self._card_stats.get(card.card_id)
             if s and s["with_wr"] is not None:
                 wr = s["with_wr"]
                 wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
-                wr_lbl = make_label(f"{wr*100:.0f}%  ({s['with_runs']})", size=10, color=wr_color)
+                grid.addWidget(make_label(f"{wr*100:.0f}%  ({s['with_runs']})", size=10, color=wr_color), row, 2)
             else:
-                wr_lbl = make_label("—", size=10, color=MUTED)
-            deck_grid.addWidget(wr_lbl, row, 2)
-
+                grid.addWidget(make_label("—", size=10, color=MUTED), row, 2)
             if s and s["win_delta"] is not None:
                 d_val = s["win_delta"]
                 sign = "+" if d_val > 0 else ""
                 d_color = WIN_COLOR if d_val > 0.05 else (LOSS_COLOR if d_val < -0.05 else MUTED)
-                d_lbl = make_label(f"{sign}{d_val*100:.0f}pp", size=10, color=d_color)
+                grid.addWidget(make_label(f"{sign}{d_val*100:.0f}pp", size=10, color=d_color), row, 3)
             else:
-                d_lbl = make_label("—", size=10, color=MUTED)
-            deck_grid.addWidget(d_lbl, row, 3)
+                grid.addWidget(make_label("—", size=10, color=MUTED), row, 3)
+        return frame
 
-        self._add(deck_frame)
-
-        # ── Relics ────────────────────────────────────────────────────
-        self._add(make_label("Relics", bold=True, size=13))
-
-        relic_frame = QFrame()
-        relic_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
-        relic_grid = QGridLayout(relic_frame)
-        relic_grid.setContentsMargins(12, 10, 12, 10)
-        relic_grid.setHorizontalSpacing(24)
-        relic_grid.setVerticalSpacing(4)
-        relic_grid.setColumnStretch(0, 3)
-        relic_grid.setColumnStretch(1, 1)
-
+    def _build_relics_grid(self, r) -> QFrame:
+        frame = QFrame()
+        frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
+        grid = QGridLayout(frame)
+        grid.setContentsMargins(12, 10, 12, 10)
+        grid.setHorizontalSpacing(24)
+        grid.setVerticalSpacing(4)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 1)
         for col, txt in enumerate(["Relic", "Win Rate"]):
-            relic_grid.addWidget(make_label(txt, bold=True, size=10, color=MUTED), 0, col)
-
+            grid.addWidget(make_label(txt, bold=True, size=10, color=MUTED), 0, col)
         for row, relic in enumerate(r.relics, start=1):
-            relic_grid.addWidget(make_label(relic.display_name, size=11), row, 0)
+            grid.addWidget(make_label(relic.display_name, size=11), row, 0)
             rs = self._relic_stats.get(relic.relic_id)
             if rs:
                 wr = rs["with_wr"]
                 wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
-                relic_grid.addWidget(make_label(f"{wr*100:.0f}%  ({rs['with_runs']})", size=10, color=wr_color), row, 1)
+                grid.addWidget(make_label(f"{wr*100:.0f}%  ({rs['with_runs']})", size=10, color=wr_color), row, 1)
             else:
-                relic_grid.addWidget(make_label("—", size=10, color=MUTED), row, 1)
-
-        self._add(relic_frame)
+                grid.addWidget(make_label("—", size=10, color=MUTED), row, 1)
+        return frame
 
 
 class ZoneCalibrationOverlay(QWidget):
@@ -1420,8 +1391,7 @@ class ZoneCalibrationOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        from card_ocr import get_game_window_rect, _CARD_X, _SEARCH_Y
-        game_rect = get_game_window_rect()
+        game_rect = card_ocr.get_game_window_rect()
         if game_rect:
             self._gx, self._gy, self._gw, self._gh = game_rect
         else:
@@ -1430,11 +1400,11 @@ class ZoneCalibrationOverlay(QWidget):
 
         self.setGeometry(self._gx, self._gy, self._gw, self._gh)
 
-        sy1 = int(self._gh * _SEARCH_Y[0])
-        sy2 = int(self._gh * _SEARCH_Y[1])
+        sy1 = int(self._gh * card_ocr._SEARCH_Y[0])
+        sy2 = int(self._gh * card_ocr._SEARCH_Y[1])
 
         self._boxes = []
-        for i, (xf1, xf2) in enumerate(_CARD_X):
+        for i, (xf1, xf2) in enumerate(card_ocr._CARD_X):
             x1 = int(self._gw * xf1)
             x2 = int(self._gw * xf2)
             box = self._make_box(i, x1, sy1, x2 - x1, sy2 - sy1)
@@ -1467,7 +1437,6 @@ class ZoneCalibrationOverlay(QWidget):
         box._start_mouse = None
 
         def paint(e, b=box):
-            from PyQt6.QtGui import QPainter, QColor, QPen, QFont
             p = QPainter(b)
             fill = QColor(b._color)
             fill.setAlpha(45)
@@ -1510,7 +1479,6 @@ class ZoneCalibrationOverlay(QWidget):
                 return
             gp = e.globalPosition().toPoint()
             if b._resize_edge:
-                from PyQt6.QtCore import QRect
                 dx = gp.x() - b._start_mouse.x()
                 dy = gp.y() - b._start_mouse.y()
                 g = QRect(b._start_geo)
@@ -1537,12 +1505,10 @@ class ZoneCalibrationOverlay(QWidget):
         return box
 
     def paintEvent(self, e):
-        from PyQt6.QtGui import QPainter, QColor
         p = QPainter(self)
         p.fillRect(self.rect(), QColor(0, 0, 0, 55))
 
     def _save(self):
-        from card_ocr import save_zones
         gw, gh = self._gw, self._gh
         card_x = []
         for box in self._boxes:
@@ -1551,7 +1517,7 @@ class ZoneCalibrationOverlay(QWidget):
         tops    = [b.geometry().top()    for b in self._boxes]
         bottoms = [b.geometry().bottom() for b in self._boxes]
         search_y = (round(min(tops) / gh, 4), round(max(bottoms) / gh, 4))
-        save_zones(card_x, search_y)
+        card_ocr.save_zones(card_x, search_y)
         self.zones_saved.emit()
         self.close()
 
@@ -1627,9 +1593,7 @@ class CardRewardOverlay(QWidget):
             pass
 
     def _place_panels(self):
-        from PyQt6.QtGui import QFontMetrics, QFont
-        from card_ocr import get_game_window_rect
-        game_rect = get_game_window_rect()
+        game_rect = card_ocr.get_game_window_rect()
         if game_rect:
             gx, gy, gw, gh = game_rect
         else:
@@ -1670,7 +1634,6 @@ class CardRewardOverlay(QWidget):
 
             s = card_stats.get(card_id)
 
-            from parser import fmt_card
             self._name_labels[i].setText(fmt_card(card_id))
             self._name_labels[i].setStyleSheet(_lbl("#ffffff", bold=True))
 
