@@ -9,8 +9,9 @@ from PyQt6.QtWidgets import (
     QFileDialog, QTextEdit, QSplitter, QHeaderView, QComboBox,
     QLineEdit, QFrame, QScrollArea, QGridLayout, QStackedWidget,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QFileSystemWatcher, QSettings
 from PyQt6.QtGui import QColor, QPixmap
+import ctypes
 
 from parser import RunSummary, find_default_save_path, fmt_card, fmt_relic
 from notes_store import load_notes, save_note
@@ -20,7 +21,8 @@ from theme import (
     DARK_BG, PANEL_BG, CARD_BG, ACCENT, ACCENT2, WIN_COLOR, LOSS_COLOR, TEXT, MUTED,
 )
 from stats import compute_card_stats, filter_runs
-from workers import RunLoader, ImageLoader
+from workers import RunLoader, ImageLoader, CardOcrWorker
+from active_run import parse_active_run, find_active_run_path, ActiveRunState
 from ui_utils import (
     make_label, SortableItem, ModeFilterWidget,
     make_char_combo, make_mode_filter, populate_char_combo,
@@ -861,6 +863,866 @@ class CardPreviewPanel(QWidget):
         return frame, box
 
 
+class ActiveRunTab(QWidget):
+    """Live view of the current in-progress run, updated whenever the save file changes."""
+
+    POLL_MS = 1_000
+    ocr_updated = pyqtSignal(list)   # emits ocr_results whenever they change
+
+    def __init__(self):
+        super().__init__()
+        self._run: ActiveRunState | None = None
+        self._card_stats: dict = {}   # populated from historical runs
+        self._relic_stats: dict = {}  # relic_id -> {with_wr, with_runs}
+        self._save_path: Path | None = None
+        self._ocr_worker = None
+        self._ocr_scanning = False           # True while a worker is in-flight
+        self._ocr_results: list = []        # [(card_id_or_None, raw_name), ...]
+        self._ocr_cache: list = [None, None, None]  # locked card_id per slot
+        self._ocr_votes: list = [[], [], []]         # rolling window of raw scan results per slot
+        self._ocr_empty_streak = 0           # consecutive all-empty OCR scans
+        self._ocr_overlay_visible: bool = False
+        self._ocr_enabled: bool = True
+        self._last_save_mtime: float = 0.0
+        self._reward_encounter_id: str | None = None
+        # Persistent refs into the live card reward panel for in-place updates
+        self._ocr_status_lbl: QLabel | None = None
+        self._ocr_slot_frames: list = []   # [(frame, name_lbl, wr_lbl, wo_lbl, avg_lbl, d_lbl)]
+        self.ocr_updated.connect(self._apply_ocr_to_panel)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+        self._inner = QWidget()
+        scroll.setWidget(self._inner)
+        self._layout = QVBoxLayout(self._inner)
+        self._layout.setContentsMargins(16, 16, 16, 16)
+        self._layout.setSpacing(14)
+
+        # Placeholder shown when no active run
+        self._placeholder = make_label(
+            "No active run detected — start a run in StS2 and it will appear here.",
+            color=MUTED, size=13,
+        )
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.addWidget(self._placeholder)
+        self._layout.addStretch()
+
+        self._content_widgets: list[QWidget] = []
+
+        # File watcher for save file
+        self._watcher = QFileSystemWatcher()
+        self._watcher.fileChanged.connect(self._on_file_changed)
+
+        # Godot log watcher — dismisses overlay immediately on card selection
+        self._log_watcher = QFileSystemWatcher()
+        self._log_watcher.fileChanged.connect(self._on_log_changed)
+        self._log_pos: int = 0
+
+        # Fallback poll timer
+        self._poll_timer = QTimer()
+        self._poll_timer.timeout.connect(self.refresh)
+        self._poll_timer.start(self.POLL_MS)
+
+    def set_save_path(self, history_path: Path | None):
+        """Called by MainWindow when the save folder is known."""
+        if history_path is None:
+            return
+        save_file = history_path.parent / "current_run.save"
+        self._save_path = save_file
+        if save_file.exists():
+            if str(save_file) not in self._watcher.files():
+                self._watcher.addPath(str(save_file))
+        log_file = history_path.parent / "logs" / "godot.log"
+        if log_file.exists():
+            self._log_pos = log_file.stat().st_size  # start at end, skip old entries
+            if str(log_file) not in self._log_watcher.files():
+                self._log_watcher.addPath(str(log_file))
+        self.refresh()
+
+    def update_historical_stats(self, runs):
+        """Called by MainWindow after runs load so we can show historical card/relic data."""
+        self._card_stats = compute_card_stats(runs)
+        relic_won: dict[str, int] = defaultdict(int)
+        relic_total: dict[str, int] = defaultdict(int)
+        for r in runs:
+            for rid in r.final_relics:
+                if rid:
+                    relic_total[rid] += 1
+                    if r.win:
+                        relic_won[rid] += 1
+        self._relic_stats = {
+            rid: {"with_wr": relic_won[rid] / total, "with_runs": total}
+            for rid, total in relic_total.items() if total
+        }
+        if self._run:
+            self._render()  # refresh display with new stats
+
+    def _on_file_changed(self, path: str):
+        # Re-watch: some editors/games write by replace, which removes the watch
+        if not self._watcher.files().__contains__(path):
+            self._watcher.addPath(path)
+        QTimer.singleShot(200, self.refresh)   # tiny delay for write to complete
+
+    def _on_log_changed(self, path: str):
+        if path not in self._log_watcher.files():
+            self._log_watcher.addPath(path)
+        try:
+            log = Path(path)
+            size = log.stat().st_size
+            if size < self._log_pos:
+                self._log_pos = 0  # file rotated/truncated
+            with open(log, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._log_pos)
+                new_text = f.read()
+                self._log_pos = f.tell()
+            if "from card reward" in new_text:
+                # Card picked — dismiss overlay immediately
+                self._ocr_scanning = False
+                self.ocr_updated.emit([])
+        except Exception:
+            pass
+
+    def refresh(self):
+        if self._save_path is None:
+            active_path = find_active_run_path()
+            if active_path:
+                self._save_path = active_path
+                self._watcher.addPath(str(active_path))
+        if self._save_path is None or not self._save_path.exists():
+            self._show_placeholder()
+            return
+        import os
+        try:
+            mtime = os.path.getmtime(self._save_path)
+        except OSError:
+            mtime = 0.0
+        run = parse_active_run(self._save_path)
+        if run is None:
+            self._show_placeholder()
+            return
+        # Only re-render if the file actually changed on disk
+        if self._run and mtime == self._last_save_mtime:
+            return
+        self._last_save_mtime = mtime
+        self._run = run
+        if run.is_reward_pending:
+            if run.reward_encounter_id != self._reward_encounter_id:
+                # New encounter — dismiss old overlay and reset OCR for new cards
+                self._reward_encounter_id = run.reward_encounter_id
+                self._ocr_cache = [None, None, None]
+                self._ocr_votes = [[], [], []]
+                self._ocr_results = []
+                self._ocr_empty_streak = 0
+                self._ocr_scanning = False
+                self._ocr_overlay_visible = False
+                self.ocr_updated.emit([])
+                # Wait 1s for card selection screen to finish loading
+                QTimer.singleShot(500, self._start_ocr)
+            else:
+                self._start_ocr()
+        else:
+            self._reward_encounter_id = None
+            self._ocr_scanning = False
+            self._ocr_results = []
+            self._ocr_cache = [None, None, None]
+            self._ocr_votes = [[], [], []]
+            self._ocr_empty_streak = 0
+            self._ocr_overlay_visible = False
+            self.ocr_updated.emit([])
+        self._render()
+
+    def set_ocr_enabled(self, enabled: bool) -> None:
+        self._ocr_enabled = enabled
+        if not enabled:
+            self._ocr_scanning = False
+            self._ocr_overlay_visible = False
+            self.ocr_updated.emit([])
+
+    def _start_ocr(self):
+        from card_ocr import is_available
+        if not is_available() or self._ocr_scanning or self._reward_encounter_id is None or not self._ocr_enabled:
+            return
+        self._ocr_scanning = True
+        all_ids = list(self._card_stats.keys()) if self._card_stats else []
+        self._ocr_worker = CardOcrWorker(all_ids)
+        self._ocr_worker.done.connect(self._on_ocr_done)
+        self._ocr_worker.start()
+
+    def _rescan(self):
+        self._ocr_cache = [None, None, None]
+        self._ocr_votes = [[], [], []]
+        self._ocr_results = []
+        self._ocr_empty_streak = 0
+        self._ocr_scanning = False
+        self.ocr_updated.emit([])
+        QTimer.singleShot(0, self._after_rescan)
+
+    def _after_rescan(self):
+        self._render()
+        self._start_ocr()
+
+    def _on_ocr_done(self, results: list):
+        self._ocr_scanning = False
+        if self._reward_encounter_id is None:
+            return  # reward cleared while scan was in flight
+
+        _OCR_MIN_SAMPLE = 5   # scans before a slot can lock
+        _OCR_LOCK_FRAC  = 0.80  # fraction of window that must agree
+
+        all_found = all(c is not None for c in self._ocr_cache)
+
+        if all_found:
+            # Watch mode: toggle overlay as the card screen appears/disappears
+            # (e.g. player opens deck view). Stop after 30 consecutive misses
+            # (~15s) which means they've fully left the reward screen.
+            known = {c for c in self._ocr_cache if c is not None}
+            still_visible = any(cid in known for cid, _ in (results or []))
+            if still_visible:
+                self._ocr_empty_streak = 0
+                if not self._ocr_overlay_visible:
+                    self._ocr_overlay_visible = True
+                    self.ocr_updated.emit(self._ocr_results)
+            else:
+                self._ocr_empty_streak += 1
+                if self._ocr_empty_streak >= 2 and self._ocr_overlay_visible:
+                    self._ocr_overlay_visible = False
+                    self.ocr_updated.emit([])
+                if self._ocr_empty_streak >= 30:
+                    self._ocr_empty_streak = 0
+                    return
+            QTimer.singleShot(500, self._start_ocr)
+            return
+
+        # Only accumulate votes once all three zones are returning text —
+        # confirms we're on the card selection screen, not an intermediate screen.
+        all_zones_have_text = results and len(results) == 3 and all(raw != "" for _, raw in results)
+        if all_zones_have_text:
+            for i, (card_id, _) in enumerate(results):
+                if card_id is not None and self._ocr_cache[i] is None:
+                    self._ocr_votes[i].append(card_id)
+                    if len(self._ocr_votes[i]) > 10:
+                        self._ocr_votes[i].pop(0)
+                    n = len(self._ocr_votes[i])
+                    if n >= _OCR_MIN_SAMPLE:
+                        from collections import Counter
+                        top_id, top_n = Counter(self._ocr_votes[i]).most_common(1)[0]
+                        if top_n / n >= _OCR_LOCK_FRAC:
+                            self._ocr_cache[i] = top_id
+
+        # Build display from locked slots + current leading candidate for unlocked
+        from collections import Counter as _Ctr
+        display = []
+        for i in range(3):
+            if self._ocr_cache[i]:
+                display.append(self._ocr_cache[i])
+            elif self._ocr_votes[i]:
+                display.append(_Ctr(self._ocr_votes[i]).most_common(1)[0][0])
+            else:
+                display.append(None)
+
+        raw_by_pos = {i: raw for i, (_, raw) in enumerate(results or [])}
+        all_raw_empty = not results or all(raw == "" for _, raw in results)
+        if any(display):
+            self._ocr_empty_streak = 0
+            self._ocr_results = [(display[i], raw_by_pos.get(i, "")) for i in range(3)]
+            self.ocr_updated.emit(self._ocr_results)
+        elif all_raw_empty:
+            # Truly nothing on screen — count toward stop threshold
+            self._ocr_empty_streak += 1
+            if self._ocr_empty_streak >= 5:
+                self._ocr_empty_streak = 0
+                return
+        # else: OCR found text but couldn't match cards yet — keep scanning
+
+        if all(c is not None for c in self._ocr_cache):
+            self._ocr_empty_streak = 0
+            QTimer.singleShot(500, self._start_ocr)
+            return
+
+        self._start_ocr()
+
+    def _show_placeholder(self):
+        self._run = None
+        self._clear_content()
+        self._placeholder.setVisible(True)
+
+    def _clear_content(self):
+        self._ocr_status_lbl = None
+        self._ocr_slot_frames = []
+        for w in self._content_widgets:
+            self._layout.removeWidget(w)
+            w.deleteLater()
+        self._content_widgets.clear()
+
+    def _add(self, w: QWidget):
+        self._content_widgets.append(w)
+        self._layout.insertWidget(self._layout.count() - 1, w)
+
+    def _build_card_reward_panel(self) -> QFrame:
+        """Build the card reward panel with pre-created slots; labels updated in-place by _apply_ocr_to_panel."""
+        panel = QFrame()
+        panel.setStyleSheet(
+            f"QFrame {{ background: {PANEL_BG}; border-radius: 8px; "
+            f"border: 2px solid {ACCENT}; }}"
+        )
+        col = QVBoxLayout(panel)
+        col.setContentsMargins(16, 12, 16, 14)
+        col.setSpacing(10)
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(make_label("Card Reward", bold=True, size=14, color=ACCENT))
+        self._ocr_status_lbl = make_label("Reading screen…", size=11, color=MUTED)
+        title_row.addWidget(self._ocr_status_lbl)
+        title_row.addStretch()
+        rescan_btn = QPushButton("Re-scan")
+        rescan_btn.setStyleSheet(
+            f"background: {CARD_BG}; color: {MUTED}; border: 1px solid {MUTED};"
+            "padding: 2px 10px; border-radius: 4px; font-size: 10pt;"
+        )
+        rescan_btn.clicked.connect(self._rescan)
+        title_row.addWidget(rescan_btn)
+        col.addLayout(title_row)
+
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(12)
+        self._ocr_slot_frames = []
+        for _ in range(3):
+            card_frame = QFrame()
+            card_frame.setStyleSheet(f"QFrame {{ background: {CARD_BG}; border-radius: 6px; border-left: 4px solid {MUTED}; }}")
+            card_frame.setVisible(False)
+            cl = QVBoxLayout(card_frame)
+            cl.setContentsMargins(12, 10, 12, 10)
+            cl.setSpacing(4)
+            name_lbl = make_label("", bold=True, size=12)
+            wr_lbl   = make_label("", size=11, color=MUTED)
+            wo_lbl   = make_label("", size=11, color=MUTED)
+            avg_lbl  = make_label("", size=11, color=MUTED)
+            d_lbl    = make_label("", size=11, color=MUTED)
+            for lbl in (name_lbl, wr_lbl, wo_lbl, avg_lbl, d_lbl):
+                cl.addWidget(lbl)
+            self._ocr_slot_frames.append((card_frame, name_lbl, wr_lbl, wo_lbl, avg_lbl, d_lbl))
+            cards_row.addWidget(card_frame, stretch=1)
+        col.addLayout(cards_row)
+
+        # Populate with any results already available
+        self._apply_ocr_to_panel(self._ocr_results)
+        return panel
+
+    def _apply_ocr_to_panel(self, ocr_results: list):
+        """Update the card reward panel labels in-place — never creates or destroys widgets."""
+        if not self._ocr_slot_frames:
+            return
+
+        has_any = any(cid for cid, _ in ocr_results) if ocr_results else False
+        if self._ocr_status_lbl:
+            self._ocr_status_lbl.setVisible(not has_any)
+
+        best_delta = None
+        if has_any:
+            deltas = [self._card_stats[cid]["win_delta"] for cid, _ in ocr_results
+                      if cid and cid in self._card_stats and self._card_stats[cid]["win_delta"] is not None]
+            best_delta = max(deltas) if deltas else None
+
+        from cards_db import get_card, TYPE_COLORS
+        for i, (card_frame, name_lbl, wr_lbl, wo_lbl, avg_lbl, d_lbl) in enumerate(self._ocr_slot_frames):
+            card_id = ocr_results[i][0] if ocr_results and i < len(ocr_results) else None
+            if not card_id:
+                card_frame.setVisible(False)
+                continue
+
+            db = get_card(card_id)
+            type_color = TYPE_COLORS.get(db["type"] if db else "Unknown", MUTED)
+            card_frame.setStyleSheet(
+                f"QFrame {{ background: {CARD_BG}; border-radius: 6px; border-left: 4px solid {type_color}; }}"
+            )
+            name_lbl.setText(fmt_card(card_id))
+
+            s = self._card_stats.get(card_id)
+            if s and s["with_wr"] is not None:
+                wr = s["with_wr"]
+                wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
+                wr_lbl.setText(f"WR with:  {wr*100:.0f}%  ({s['with_runs']})")
+                wr_lbl.setStyleSheet(f"color: {wr_color};")
+
+                wor = s["without_wr"]
+                wo_lbl.setText(f"WR w/out: {wor*100:.0f}%  ({s['without_runs']})" if wor is not None else "WR w/out: —")
+                wo_lbl.setStyleSheet(f"color: {WIN_COLOR if (wor or 0) >= 0.5 else (LOSS_COLOR if wor is not None else MUTED)};")
+
+                avg = s["avg_copies_per_run"]
+                avg_color = WIN_COLOR if (avg or 0) >= 1.5 else (ACCENT2 if (avg or 0) > 1.0 else MUTED)
+                avg_lbl.setText(f"Avg:      {f'{avg:.2f}×' if avg else '—'} in deck")
+                avg_lbl.setStyleSheet(f"color: {avg_color};")
+
+                delta = s["win_delta"]
+                if delta is not None:
+                    sign = "+" if delta > 0 else ""
+                    is_best = best_delta is not None and abs(delta - best_delta) < 0.001
+                    d_color = WIN_COLOR if delta > 0.05 else (LOSS_COLOR if delta < -0.05 else MUTED)
+                    d_lbl.setText(f"Δ:        {sign}{delta*100:.1f}pp" + (" ★" if is_best else ""))
+                    d_lbl.setStyleSheet(f"color: {d_color}; {'font-weight: bold;' if is_best else ''}")
+                else:
+                    d_lbl.setText("Δ:        —")
+                    d_lbl.setStyleSheet(f"color: {MUTED};")
+            else:
+                wr_lbl.setText("No history yet")
+                wr_lbl.setStyleSheet(f"color: {MUTED};")
+                wo_lbl.setText(""); avg_lbl.setText(""); d_lbl.setText("")
+
+            card_frame.setVisible(True)
+
+    def _render(self):
+        self._clear_content()
+        self._placeholder.setVisible(False)
+        r = self._run
+
+        # ── Card Reward panel (shown when fight just won, reward pending) ──
+        if r.is_reward_pending:
+            self._add(self._build_card_reward_panel())
+
+        # ── Header strip ──────────────────────────────────────────────
+        header = QFrame()
+        header.setStyleSheet(f"QFrame {{ background: {CARD_BG}; border-radius: 8px; }}")
+        hrow = QHBoxLayout(header)
+        hrow.setContentsMargins(16, 12, 16, 12)
+        hrow.setSpacing(24)
+
+        char_color = CHAR_COLORS.get(r.character_display, TEXT)
+        hrow.addWidget(make_label(r.character_display, bold=True, size=18, color=char_color))
+
+        mode_str = "Daily" if r.is_daily else (f"MP ({r.player_count}p)" if r.is_multiplayer else "SP")
+        hrow.addWidget(make_label(f"A{r.ascension}  •  {mode_str}", size=12, color=MUTED))
+        hrow.addWidget(make_label(f"{r.act_display}  •  Floor {r.floors_completed}", size=13))
+        hrow.addStretch()
+
+        # HP bar
+        hp_color = WIN_COLOR if r.hp_pct > 0.5 else ("#f39c12" if r.hp_pct > 0.25 else LOSS_COLOR)
+        hp_frame = QFrame()
+        hp_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
+        hp_col = QVBoxLayout(hp_frame)
+        hp_col.setContentsMargins(10, 6, 10, 6)
+        hp_col.setSpacing(2)
+        hp_col.addWidget(make_label(f"HP  {r.current_hp} / {r.max_hp}", bold=True, size=12, color=hp_color))
+        hp_col.addWidget(bar_widget(r.hp_pct, hp_color))
+        hrow.addWidget(hp_frame)
+
+        # Gold
+        hrow.addWidget(make_label(f"💰 {r.gold}", bold=True, size=13, color="#f1c40f"))
+
+        # Potions
+        if r.potions:
+            pot_str = "  ".join(p.display_name for p in r.potions)
+            hrow.addWidget(make_label(f"🧪 {pot_str}", size=11, color=MUTED))
+
+        self._add(header)
+
+        # ── Deck ──────────────────────────────────────────────────────
+        self._add(make_label("Deck", bold=True, size=13))
+
+        deck_frame = QFrame()
+        deck_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
+        deck_grid = QGridLayout(deck_frame)
+        deck_grid.setContentsMargins(12, 10, 12, 10)
+        deck_grid.setHorizontalSpacing(12)
+        deck_grid.setVerticalSpacing(6)
+        deck_grid.setColumnStretch(0, 3)  # card name
+        deck_grid.setColumnStretch(1, 2)  # description
+        deck_grid.setColumnStretch(2, 1)  # WR with
+        deck_grid.setColumnStretch(3, 1)  # win delta
+
+        # Header row
+        for col, txt in enumerate(["Card", "Effect", "WR With", "Win Δ"]):
+            lbl = make_label(txt, bold=True, size=10, color=MUTED)
+            deck_grid.addWidget(lbl, 0, col)
+
+        # Sort deck by floor added
+        sorted_deck = sorted(r.deck, key=lambda c: c.floor_added)
+        for row, card in enumerate(sorted_deck, start=1):
+            db = get_card(card.card_id)
+            card_type = db["type"] if db else "Skill"
+            type_color = TYPE_COLORS.get(card_type, MUTED)
+
+            name_lbl = make_label(card.display_name, size=11)
+            name_lbl.setStyleSheet(f"color: {TEXT}; border-left: 3px solid {type_color}; padding-left: 6px;")
+            deck_grid.addWidget(name_lbl, row, 0)
+
+            desc = (db["desc"] if db else "") or ""
+            desc_lbl = QLabel(desc[:80] + ("…" if len(desc) > 80 else ""))
+            desc_lbl.setStyleSheet(f"color: {MUTED}; font-size: 10pt;")
+            desc_lbl.setWordWrap(False)
+            deck_grid.addWidget(desc_lbl, row, 1)
+
+            # Historical stats for this card
+            s = self._card_stats.get(card.card_id)
+            if s and s["with_wr"] is not None:
+                wr = s["with_wr"]
+                wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
+                wr_lbl = make_label(f"{wr*100:.0f}%  ({s['with_runs']})", size=10, color=wr_color)
+            else:
+                wr_lbl = make_label("—", size=10, color=MUTED)
+            deck_grid.addWidget(wr_lbl, row, 2)
+
+            if s and s["win_delta"] is not None:
+                d_val = s["win_delta"]
+                sign = "+" if d_val > 0 else ""
+                d_color = WIN_COLOR if d_val > 0.05 else (LOSS_COLOR if d_val < -0.05 else MUTED)
+                d_lbl = make_label(f"{sign}{d_val*100:.0f}pp", size=10, color=d_color)
+            else:
+                d_lbl = make_label("—", size=10, color=MUTED)
+            deck_grid.addWidget(d_lbl, row, 3)
+
+        self._add(deck_frame)
+
+        # ── Relics ────────────────────────────────────────────────────
+        self._add(make_label("Relics", bold=True, size=13))
+
+        relic_frame = QFrame()
+        relic_frame.setStyleSheet(f"QFrame {{ background: {PANEL_BG}; border-radius: 6px; }}")
+        relic_grid = QGridLayout(relic_frame)
+        relic_grid.setContentsMargins(12, 10, 12, 10)
+        relic_grid.setHorizontalSpacing(24)
+        relic_grid.setVerticalSpacing(4)
+        relic_grid.setColumnStretch(0, 3)
+        relic_grid.setColumnStretch(1, 1)
+
+        for col, txt in enumerate(["Relic", "Win Rate"]):
+            relic_grid.addWidget(make_label(txt, bold=True, size=10, color=MUTED), 0, col)
+
+        for row, relic in enumerate(r.relics, start=1):
+            relic_grid.addWidget(make_label(relic.display_name, size=11), row, 0)
+            rs = self._relic_stats.get(relic.relic_id)
+            if rs:
+                wr = rs["with_wr"]
+                wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
+                relic_grid.addWidget(make_label(f"{wr*100:.0f}%  ({rs['with_runs']})", size=10, color=wr_color), row, 1)
+            else:
+                relic_grid.addWidget(make_label("—", size=10, color=MUTED), row, 1)
+
+        self._add(relic_frame)
+
+
+class ZoneCalibrationOverlay(QWidget):
+    """Interactive overlay showing the OCR search zones as draggable/resizable boxes."""
+
+    zones_saved = pyqtSignal()
+    _COLORS = ["#00ff88", "#00ccff", "#ff9900"]
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        from card_ocr import get_game_window_rect, _CARD_X, _SEARCH_Y
+        game_rect = get_game_window_rect()
+        if game_rect:
+            self._gx, self._gy, self._gw, self._gh = game_rect
+        else:
+            geo = QApplication.primaryScreen().geometry()
+            self._gx, self._gy, self._gw, self._gh = geo.x(), geo.y(), geo.width(), geo.height()
+
+        self.setGeometry(self._gx, self._gy, self._gw, self._gh)
+
+        sy1 = int(self._gh * _SEARCH_Y[0])
+        sy2 = int(self._gh * _SEARCH_Y[1])
+
+        self._boxes = []
+        for i, (xf1, xf2) in enumerate(_CARD_X):
+            x1 = int(self._gw * xf1)
+            x2 = int(self._gw * xf2)
+            box = self._make_box(i, x1, sy1, x2 - x1, sy2 - sy1)
+            self._boxes.append(box)
+
+        done_btn = QPushButton("Save & Close", self)
+        done_btn.setStyleSheet(
+            "background: #1a1a2e; color: #00ff88; border: 2px solid #00ff88;"
+            "padding: 8px 20px; font-size: 13pt; font-weight: bold; border-radius: 6px;"
+        )
+        done_btn.adjustSize()
+        done_btn.move(20, 20)
+        done_btn.clicked.connect(self._save)
+
+        hint = QLabel("Drag boxes onto card name banners. Resize from edges.", self)
+        hint.setStyleSheet(
+            "color: white; font-size: 11pt; background: rgba(0,0,0,170); padding: 4px 12px; border-radius: 4px;"
+        )
+        hint.adjustSize()
+        hint.move(20, done_btn.height() + 32)
+
+    def _make_box(self, idx: int, x: int, y: int, w: int, h: int) -> QWidget:
+        color = self._COLORS[idx]
+        box = QWidget(self)
+        box.setGeometry(x, y, w, h)
+        box._color = color
+        box._drag_offset = None
+        box._resize_edge = None
+        box._start_geo = None
+        box._start_mouse = None
+
+        def paint(e, b=box):
+            from PyQt6.QtGui import QPainter, QColor, QPen, QFont
+            p = QPainter(b)
+            fill = QColor(b._color)
+            fill.setAlpha(45)
+            p.fillRect(b.rect(), fill)
+            pen = QPen(QColor(b._color), 3)
+            p.setPen(pen)
+            p.drawRect(1, 1, b.width() - 3, b.height() - 3)
+            p.setPen(QColor("white"))
+            f = QFont(); f.setPointSize(11); f.setBold(True)
+            p.setFont(f)
+            p.drawText(b.rect(), Qt.AlignmentFlag.AlignCenter, f"Card {idx + 1}")
+
+        def _edge(pos, b=box):
+            m, x_, y_, w_, h_ = 12, pos.x(), pos.y(), b.width(), b.height()
+            r = abs(x_ - w_) < m; bot = abs(y_ - h_) < m
+            l = x_ < m;           top = y_ < m
+            if r and bot: return "br"
+            if l and top: return "tl"
+            if r: return "r"
+            if bot: return "b"
+            if l: return "l"
+            if top: return "t"
+            return None
+
+        def press(e, b=box):
+            if e.button() != Qt.MouseButton.LeftButton: return
+            b._resize_edge  = _edge(e.position().toPoint())
+            b._drag_offset  = e.globalPosition().toPoint() - b.pos()
+            b._start_geo    = b.geometry()
+            b._start_mouse  = e.globalPosition().toPoint()
+
+        def move(e, b=box):
+            pos = e.position().toPoint()
+            if not (b._drag_offset or b._resize_edge):
+                cursors = {"br":"SizeFDiagCursor","tl":"SizeFDiagCursor",
+                           "r":"SizeHorCursor","l":"SizeHorCursor",
+                           "b":"SizeVerCursor","t":"SizeVerCursor"}
+                c = cursors.get(_edge(pos), "SizeAllCursor")
+                b.setCursor(getattr(Qt.CursorShape, c))
+                return
+            gp = e.globalPosition().toPoint()
+            if b._resize_edge:
+                from PyQt6.QtCore import QRect
+                dx = gp.x() - b._start_mouse.x()
+                dy = gp.y() - b._start_mouse.y()
+                g = QRect(b._start_geo)
+                ed = b._resize_edge
+                if "r" in ed: g.setRight(g.right() + dx)
+                if "b" in ed: g.setBottom(g.bottom() + dy)
+                if "l" in ed: g.setLeft(g.left() + dx)
+                if "t" in ed: g.setTop(g.top() + dy)
+                if g.width() > 20 and g.height() > 8:
+                    b.setGeometry(g)
+            elif b._drag_offset:
+                b.move(gp - b._drag_offset)
+            b.update()
+
+        def release(e, b=box):
+            b._drag_offset = None
+            b._resize_edge = None
+
+        box.paintEvent        = paint
+        box.mousePressEvent   = press
+        box.mouseMoveEvent    = move
+        box.mouseReleaseEvent = release
+        box.setCursor(Qt.CursorShape.SizeAllCursor)
+        return box
+
+    def paintEvent(self, e):
+        from PyQt6.QtGui import QPainter, QColor
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 55))
+
+    def _save(self):
+        from card_ocr import save_zones
+        gw, gh = self._gw, self._gh
+        card_x = []
+        for box in self._boxes:
+            g = box.geometry()
+            card_x.append((round(g.left() / gw, 4), round(g.right() / gw, 4)))
+        tops    = [b.geometry().top()    for b in self._boxes]
+        bottoms = [b.geometry().bottom() for b in self._boxes]
+        search_y = (round(min(tops) / gh, 4), round(max(bottoms) / gh, 4))
+        save_zones(card_x, search_y)
+        self.zones_saved.emit()
+        self.close()
+
+
+class CardRewardOverlay(QWidget):
+    """Full-screen transparent always-on-top overlay showing card reward stats.
+
+    Completely click-through — all mouse events fall through to the game.
+    Three small panels are positioned above each card's name banner.
+    """
+
+    # Card x-centres and panel y-band as fractions of the primary screen.
+    # x values are midpoints of the OCR banner regions in card_ocr._CARD_X.
+    _CX = [0.371, 0.507, 0.643]
+    _PY_BOTTOM = 0.40        # panel bottom as fraction of game height
+    _PW_FRAC = 0.076         # panel width as fraction of game width (~195px at 2560)
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        geo = QApplication.primaryScreen().geometry()
+        self.setGeometry(geo)
+
+        self._panels: list[QFrame] = []
+        self._name_labels:       list[QLabel] = []
+        self._wr_with_labels:    list[QLabel] = []
+        self._wr_without_labels: list[QLabel] = []
+        self._avg_copies_labels: list[QLabel] = []
+        self._delta_labels:      list[QLabel] = []
+
+        for _ in range(3):
+            panel = QFrame(self)
+            panel.setStyleSheet(
+                "QFrame { background: rgba(10,15,30,185); border-radius: 6px; }"
+            )
+            vl = QVBoxLayout(panel)
+            vl.setContentsMargins(6, 2, 6, 2)
+            vl.setSpacing(0)
+            lbls = [QLabel() for _ in range(5)]
+            for lbl in lbls:
+                lbl.setStyleSheet("background: transparent;")
+                font = lbl.font()
+                font.setPointSize(13)
+                lbl.setFont(font)
+                vl.addWidget(lbl)
+            self._panels.append(panel)
+            self._name_labels.append(lbls[0])
+            self._wr_with_labels.append(lbls[1])
+            self._wr_without_labels.append(lbls[2])
+            self._avg_copies_labels.append(lbls[3])
+            self._delta_labels.append(lbls[4])
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Ensure Windows treats this window as click-through even if Qt's flag
+        # isn't sufficient on its own.
+        try:
+            hwnd = int(self.winId())
+            GWL_EXSTYLE = -20
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE, style | 0x80000 | 0x20  # WS_EX_LAYERED | WS_EX_TRANSPARENT
+            )
+        except Exception:
+            pass
+
+    def _place_panels(self):
+        from PyQt6.QtGui import QFontMetrics, QFont
+        from card_ocr import get_game_window_rect
+        game_rect = get_game_window_rect()
+        if game_rect:
+            gx, gy, gw, gh = game_rect
+        else:
+            geo = QApplication.primaryScreen().geometry()
+            gx, gy, gw, gh = geo.x(), geo.y(), geo.width(), geo.height()
+        y_bottom = gy + int(gh * self._PY_BOTTOM)
+        pw = max(150, int(gw * self._PW_FRAC))
+        f = QFont()
+        f.setPointSize(13)
+        line_h = QFontMetrics(f).height()
+        ph = line_h * 5 + 8
+        for i, cx_frac in enumerate(self._CX):
+            cx = gx + int(gw * cx_frac)
+            self._panels[i].setGeometry(cx - pw // 2, y_bottom - ph, pw, ph)
+
+    def update_results(self, ocr_results: list, card_stats: dict):
+        """Show/update panels from OCR results. ocr_results = [(card_id|None, raw), ...]"""
+        self._place_panels()
+        if not ocr_results or not any(cid for cid, _ in ocr_results):
+            self.hide()
+            return
+
+        valid_deltas = [
+            card_stats[cid]["win_delta"]
+            for cid, _ in ocr_results
+            if cid and cid in card_stats and card_stats[cid]["win_delta"] is not None
+        ]
+        best_delta = max(valid_deltas) if valid_deltas else None
+
+        def _lbl(color, bold=False):
+            return f"color: {color}; background: transparent;" + (" font-weight: bold;" if bold else "")
+
+        any_visible = False
+        for i, (card_id, _) in enumerate(ocr_results):
+            if not card_id:
+                self._panels[i].setVisible(False)
+                continue
+
+            s = card_stats.get(card_id)
+
+            from parser import fmt_card
+            self._name_labels[i].setText(fmt_card(card_id))
+            self._name_labels[i].setStyleSheet(_lbl("#ffffff", bold=True))
+
+            if s and s["with_wr"] is not None:
+                wr = s["with_wr"]
+                wr_color = WIN_COLOR if wr >= 0.5 else LOSS_COLOR
+                self._wr_with_labels[i].setText(f"WR With:  {wr*100:.0f}%  ({s['with_runs']})")
+                self._wr_with_labels[i].setStyleSheet(_lbl(wr_color))
+
+                wor = s["without_wr"]
+                if wor is not None:
+                    wor_color = WIN_COLOR if wor >= 0.5 else LOSS_COLOR
+                    self._wr_without_labels[i].setText(f"WR W/out: {wor*100:.0f}%  ({s['without_runs']})")
+                    self._wr_without_labels[i].setStyleSheet(_lbl(wor_color))
+                else:
+                    self._wr_without_labels[i].setText("WR W/out: —")
+                    self._wr_without_labels[i].setStyleSheet(_lbl(MUTED))
+
+                avg = s["avg_copies_per_run"]
+                avg_color = WIN_COLOR if (avg or 0) >= 1.5 else (ACCENT2 if (avg or 0) > 1.0 else MUTED)
+                self._avg_copies_labels[i].setText(f"Avg:   {f'{avg:.2f}×' if avg else '—'} in deck")
+                self._avg_copies_labels[i].setStyleSheet(_lbl(avg_color))
+
+                delta = s["win_delta"]
+                if delta is not None:
+                    sign = "+" if delta > 0 else ""
+                    is_best = best_delta is not None and abs(delta - best_delta) < 0.001
+                    d_color = WIN_COLOR if delta > 0.05 else (LOSS_COLOR if delta < -0.05 else MUTED)
+                    self._delta_labels[i].setText(f"Δ:     {sign}{delta*100:.1f}pp" + (" ★" if is_best else ""))
+                    self._delta_labels[i].setStyleSheet(_lbl(d_color, bold=is_best))
+                else:
+                    self._delta_labels[i].setText("Δ:     —")
+                    self._delta_labels[i].setStyleSheet(_lbl(MUTED))
+            else:
+                self._wr_with_labels[i].setText("No history yet")
+                self._wr_with_labels[i].setStyleSheet(_lbl(MUTED))
+                self._wr_without_labels[i].setText("")
+                self._avg_copies_labels[i].setText("")
+                self._delta_labels[i].setText("")
+
+            self._panels[i].setVisible(True)
+            any_visible = True
+
+        if any_visible:
+            self.show()
+        else:
+            self.hide()
+
+    def hide_overlay(self):
+        self.hide()
+
+
 class MainWindow(QMainWindow):
     REFRESH_MS = 30_000
 
@@ -880,11 +1742,13 @@ class MainWindow(QMainWindow):
         content.setHandleWidth(2)
 
         self.tabs = QTabWidget()
+        self.active_run_tab = ActiveRunTab()
         self.overview_tab = OverviewTab()
         self.run_history_tab = RunHistoryTab()
         self.card_stats_tab = CardStatsTab()
         self.card_rankings_tab = CardRankingsTab()
         self.relic_stats_tab = RelicStatsTab()
+        self.tabs.addTab(self.active_run_tab, "⚔ Active Run")
         self.tabs.addTab(self.overview_tab, "Overview")
         self.tabs.addTab(self.run_history_tab, "Run History")
         self.tabs.addTab(self.card_stats_tab, "Card Stats")
@@ -906,6 +1770,14 @@ class MainWindow(QMainWindow):
         self.card_rankings_tab.card_selected.connect(self._on_card_selected)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self._on_tab_changed(self.tabs.currentIndex())
+
+        self._overlay = CardRewardOverlay()
+        self.active_run_tab.ocr_updated.connect(self._on_ocr_updated)
+
+        self._settings = QSettings("sts2tracker", "sts2tracker")
+        ocr_on = self._settings.value("ocr_enabled", True, type=bool)
+        self.ocr_toggle_btn.setChecked(ocr_on)
+        self._apply_ocr_toggle(ocr_on)
 
         self._save_path: Path | None = None
         self._loader: RunLoader | None = None
@@ -940,6 +1812,20 @@ class MainWindow(QMainWindow):
         self.refresh_btn.setStyleSheet(f"background: {ACCENT2}; color: white; border: none; padding: 5px 14px; border-radius: 4px;")
         self.refresh_btn.clicked.connect(self._reload)
         row.addWidget(self.refresh_btn)
+
+        self.zones_btn = QPushButton("OCR Zones")
+        self.zones_btn.setStyleSheet(f"background: {CARD_BG}; color: #00ff88; border: 1px solid #00ff88; padding: 5px 14px; border-radius: 4px;")
+        self.zones_btn.clicked.connect(self._show_zone_calibration)
+        row.addWidget(self.zones_btn)
+
+        self.ocr_toggle_btn = QPushButton("Card OCR: ON")
+        self.ocr_toggle_btn.setCheckable(True)
+        self.ocr_toggle_btn.setChecked(True)
+        self.ocr_toggle_btn.setStyleSheet(
+            f"background: {CARD_BG}; color: #00ff88; border: 1px solid #00ff88; padding: 5px 14px; border-radius: 4px;"
+        )
+        self.ocr_toggle_btn.toggled.connect(self._toggle_ocr)
+        row.addWidget(self.ocr_toggle_btn)
         return header
 
     def _on_tab_changed(self, idx: int):
@@ -952,6 +1838,24 @@ class MainWindow(QMainWindow):
             self.right_stack.setVisible(True)
         else:
             self.right_stack.setVisible(False)
+
+    def _toggle_ocr(self, checked: bool) -> None:
+        self._settings.setValue("ocr_enabled", checked)
+        self._apply_ocr_toggle(checked)
+
+    def _apply_ocr_toggle(self, enabled: bool) -> None:
+        self.active_run_tab.set_ocr_enabled(enabled)
+        self.zones_btn.setEnabled(enabled)
+        if enabled:
+            self.ocr_toggle_btn.setText("Card OCR: ON")
+            self.ocr_toggle_btn.setStyleSheet(
+                f"background: {CARD_BG}; color: #00ff88; border: 1px solid #00ff88; padding: 5px 14px; border-radius: 4px;"
+            )
+        else:
+            self.ocr_toggle_btn.setText("Card OCR: OFF")
+            self.ocr_toggle_btn.setStyleSheet(
+                f"background: {CARD_BG}; color: {MUTED}; border: 1px solid {MUTED}; padding: 5px 14px; border-radius: 4px;"
+            )
 
     def _browse(self):
         folder = QFileDialog.getExistingDirectory(
@@ -969,6 +1873,7 @@ class MainWindow(QMainWindow):
         self.path_label.setText(str(path))
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Loading...")
+        self.active_run_tab.set_save_path(path)
         self._loader = RunLoader(path)
         self._loader.done.connect(self._on_loaded)
         self._loader.start()
@@ -982,11 +1887,28 @@ class MainWindow(QMainWindow):
         self.card_preview.set_runs(filtered, char_f)
         self.card_preview.show_card(card_id)
 
+    def _show_zone_calibration(self):
+        self._calib = ZoneCalibrationOverlay()
+        self._calib.zones_saved.connect(lambda: None)  # zones reload on next OCR scan
+        self._calib.show()
+
+    def _on_ocr_updated(self, ocr_results: list):
+        try:
+            if ocr_results:
+                self._overlay.update_results(ocr_results, self.active_run_tab._card_stats)
+            else:
+                self._overlay.hide_overlay()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            self._overlay.hide_overlay()
+
     def _on_loaded(self, runs: list[RunSummary]):
         self._all_runs = runs
         for tab in (self.overview_tab, self.run_history_tab, self.card_stats_tab,
                     self.card_rankings_tab, self.relic_stats_tab):
             tab.load_runs(runs)
+        self.active_run_tab.update_historical_stats(runs)
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("Refresh")
 

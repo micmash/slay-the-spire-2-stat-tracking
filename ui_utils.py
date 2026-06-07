@@ -33,7 +33,7 @@ class ModeFilterWidget(QWidget):
         cb = QCheckBox(label)
         cb.setChecked(True)
         cb.setStyleSheet(f"color: {TEXT}; spacing: 4px;")
-        cb.checkStateChanged.connect(self.changed)
+        cb.clicked.connect(lambda _checked: self.changed.emit())
         layout.addWidget(cb)
         return cb
 
@@ -178,21 +178,31 @@ def repopulate_table(table: QTableWidget, populate_fn: Callable[[], None]) -> No
     - blocks signals so selection changes mid-rebuild don't fire callbacks
     - disables sorting during population (avoids re-sort on every setItem)
     - saves & restores the user's sort indicator so filtering keeps the sort
+    - re-entrant guard prevents the internal sortByColumn from triggering a
+      second _refresh through any connected header signals
     """
-    hdr = table.horizontalHeader()
-    sort_col = hdr.sortIndicatorSection()
-    sort_order = hdr.sortIndicatorOrder()
+    if getattr(table, "_repopulating", False):
+        return
+    table._repopulating = True
+    try:
+        hdr = table.horizontalHeader()
+        sort_col = hdr.sortIndicatorSection()
+        sort_order = hdr.sortIndicatorOrder()
 
-    table.blockSignals(True)
-    table.setSortingEnabled(False)
-    table.clearContents()
+        table.blockSignals(True)
+        hdr.blockSignals(True)
+        table.setSortingEnabled(False)
+        table.clearContents()
 
-    populate_fn()
+        populate_fn()
 
-    table.setSortingEnabled(True)
-    if sort_col >= 0:
-        table.sortByColumn(sort_col, sort_order)
-    table.blockSignals(False)
+        table.setSortingEnabled(True)
+        if sort_col >= 0:
+            table.sortByColumn(sort_col, sort_order)
+        hdr.blockSignals(False)
+        table.blockSignals(False)
+    finally:
+        table._repopulating = False
 
 
 def export_table_to_csv(table: QTableWidget, parent: QWidget | None = None) -> None:

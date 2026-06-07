@@ -31,3 +31,29 @@ class ImageLoader(QThread):
     def run(self):
         path = get_image_path(self.card_id, self.char_hint)
         self.done.emit(str(path) if path else "")
+
+
+class CardOcrWorker(QThread):
+    """Takes a screenshot and OCRs the three card reward name areas off the UI thread.
+
+    Emits a list of (card_id_or_None, raw_ocr_text) pairs.
+    """
+    done = pyqtSignal(list)
+
+    def __init__(self, all_card_ids: list[str]):
+        super().__init__()
+        self._card_ids = all_card_ids
+
+    def run(self):
+        try:
+            from card_ocr import read_card_reward_names, match_to_card_ids
+            raw = read_card_reward_names()
+            if not raw:
+                self.done.emit([])
+                return
+            matched = match_to_card_ids(raw, self._card_ids)
+            self.done.emit(list(zip(matched, raw)))
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            self.done.emit([])
