@@ -4,7 +4,7 @@
 DARK_BG = "#1a1a2e"
 PANEL_BG = "#16213e"
 CARD_BG = "#0f3460"
-ACCENT = "#e94560"
+ACCENT = "#e0963a"
 ACCENT2 = "#533483"
 WIN_COLOR = "#4caf50"
 LOSS_COLOR = "#e94560"
@@ -22,7 +22,7 @@ QTableWidget::item {{ padding: 4px 8px; }}
 QTableWidget::item:selected {{ background: {ACCENT2}; color: white; }}
 QHeaderView::section {{ background: {CARD_BG}; color: {TEXT}; padding: 6px 8px; border: none; font-weight: bold; }}
 QPushButton {{ background: {ACCENT}; color: white; border: none; padding: 7px 18px; border-radius: 4px; font-size: 13px; }}
-QPushButton:hover {{ background: #c73652; }}
+QPushButton:hover {{ background: #c47d28; }}
 QPushButton.secondary {{ background: {CARD_BG}; }}
 QPushButton.secondary:hover {{ background: {ACCENT2}; }}
 QComboBox {{ background: {CARD_BG}; color: {TEXT}; border: 1px solid {ACCENT2}; padding: 4px 8px; border-radius: 4px; }}
