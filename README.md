@@ -32,8 +32,8 @@ run history, to help with picks.
 ## Requirements
 
 - Python 3.11+
-- [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) installed and on PATH (for the card reward overlay)
 - `pip install PyQt6 pytesseract Pillow numpy mss`
+- Tesseract OCR — either installed system-wide **or** bundled via `setup_vendor.py` (see below)
 
 ## Run it
 
@@ -41,14 +41,42 @@ run history, to help with picks.
 python app.py
 ```
 
-Or double-click `launch.bat` (keeps the console open on crash), or build a standalone exe:
+Or double-click `launch.bat` (keeps the console open on crash).
+
+## Tesseract setup
+
+The card reward OCR feature requires Tesseract. Two options:
+
+**Option A — System install (simplest for development)**
+
+Install from [UB-Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) and the app will find it automatically.
+
+**Option B — Bundled (no system install needed)**
+
+Copy Tesseract into `vendor/tesseract/` using the helper script:
 
 ```sh
-python -m PyInstaller --onefile --windowed --name STS2Tracker --hidden-import PyQt6.sip app.py
+python setup_vendor.py
+# or, if Tesseract is in a non-default location:
+python setup_vendor.py "C:\path\to\Tesseract-OCR"
 ```
 
-The exe lands in `dist/`. Save data is auto-detected from
-`%APPDATA%\SlayTheSpire2\...\saves\history`; use **Browse...** to point elsewhere.
+The app checks `vendor/tesseract/tesseract.exe` first, so this works without any system-wide install.
+
+## Build a standalone exe
+
+First run `setup_vendor.py` so Tesseract is in `vendor/`, then:
+
+```sh
+python -m PyInstaller --onefile --windowed --name STS2Tracker ^
+  --hidden-import PyQt6.sip ^
+  --add-data "vendor;vendor" ^
+  app.py
+```
+
+The exe lands in `dist/` and is fully self-contained — no Python or Tesseract install required on the target machine.
+
+Save data is auto-detected from `%APPDATA%\SlayTheSpire2\...\saves\history`; use **Browse...** to point elsewhere.
 
 ## Module layout
 

@@ -12,6 +12,9 @@ dist/
 # Card image cache (downloaded on demand, not committed)
 card_img_cache/
 
+# Vendored binaries (populated by setup_vendor.py, not committed)
+vendor/
+
 # User data (personal notes, not shared)
 run_notes.json
 

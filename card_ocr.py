@@ -1,6 +1,7 @@
 """Screen OCR for reading card reward options from the STS2 card pick screen."""
 import ctypes
 import ctypes.wintypes
+import sys
 from pathlib import Path
 from typing import Optional
 from difflib import get_close_matches
@@ -18,6 +19,16 @@ _TESS_PATHS = [
     r'C:\Program Files\Tesseract-OCR\tesseract.exe',
     r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
 ]
+
+
+def _vendor_tesseract() -> Path | None:
+    """Return path to vendored tesseract.exe if it exists (dev tree or PyInstaller bundle)."""
+    if getattr(sys, 'frozen', False):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).parent
+    candidate = base / "vendor" / "tesseract" / "tesseract.exe"
+    return candidate if candidate.exists() else None
 
 # Horizontal card columns and vertical search band as fractions of game dimensions.
 # Defaults; overridden by ocr_config.json if it exists.
@@ -86,6 +97,9 @@ def get_game_window_rect() -> tuple[int, int, int, int] | None:
 
 def _find_tesseract() -> Optional[str]:
     import shutil
+    # Vendored copy takes priority (works both in dev tree and PyInstaller bundle)
+    if vendored := _vendor_tesseract():
+        return str(vendored)
     if found := shutil.which("tesseract"):
         return found
     for p in _TESS_PATHS:
@@ -155,6 +169,10 @@ def read_card_reward_names() -> list[str]:
     if not tess:
         return []
     pytesseract.pytesseract.tesseract_cmd = tess
+    # Point tesseract at the vendored tessdata if using the bundled binary
+    if vendored := _vendor_tesseract():
+        import os
+        os.environ.setdefault("TESSDATA_PREFIX", str(vendored.parent / "tessdata"))
 
     game_rect = get_game_window_rect()
     with _mss.mss() as sct:
